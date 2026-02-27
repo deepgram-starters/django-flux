@@ -46,5 +46,4 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
 # Launch Daphne ASGI server
 from daphne.cli import CommandLineInterface
-sys.argv = ["daphne", "-b", host, "-p", str(port), "config.asgi:application"]
-CommandLineInterface().run()
+CommandLineInterface().run(["-b", host, "-p", str(port), "config.asgi:application"])
