@@ -158,6 +158,10 @@ class FluxConsumer(AsyncWebsocketConsumer):
             async for message in self.connection:
                 if isinstance(message, (bytes, bytearray)):
                     await self.send(bytes_data=bytes(message))
+                elif isinstance(message, dict):
+                    # listen.v2 (Flux) yields plain dicts (e.g. TurnInfo); forward as-is
+                    # so the transcript reaches the browser instead of {"type":"Unknown"}.
+                    await self.send(text_data=json.dumps(message))
                 elif hasattr(message, "model_dump_json"):
                     await self.send(text_data=message.model_dump_json())
                 else:
