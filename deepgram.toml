@@ -6,6 +6,7 @@ repository = "https://github.com/deepgram-starters/django-flux"
 useCase = "flux"
 language = "python"
 framework = "django"
+sdk = "deepgram-sdk"
 tags = ["flux", "streaming", "speech-to-text", "real-time", "turn-detection", "django", "python"]
 
 [check]
