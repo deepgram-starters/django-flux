@@ -1,12 +1,17 @@
-"""WebSocket consumer for Flux - Raw WebSocket proxy to Deepgram"""
+"""WebSocket consumer for Flux — bridges the browser to Deepgram listen.v2 (Flux) via the SDK."""
 import os
 import json
 import asyncio
-from urllib.parse import parse_qs, urlencode
-from channels.generic.websocket import AsyncWebsocketConsumer
-import websockets
+from urllib.parse import parse_qs
+
 import jwt
+from channels.generic.websocket import AsyncWebsocketConsumer
 from dotenv import load_dotenv
+
+from deepgram import AsyncDeepgramClient
+from deepgram.environment import DeepgramClientEnvironment
+from deepgram.core.api_error import ApiError
+from deepgram.listen.v2.types import ListenV2CloseStream
 from starter.views import SESSION_SECRET
 
 load_dotenv()
@@ -14,16 +19,46 @@ API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 if not API_KEY:
     raise ValueError("DEEPGRAM_API_KEY required")
 
-DEEPGRAM_STT_URL = "wss://api.deepgram.com/v2/listen"
 DEFAULT_MODEL = "flux-general-en"
+
+
+# One async SDK client, reused across connections; the browser never sees the API key.
+# DEEPGRAM_BASE_URL (e.g. wss://api.staging.deepgram.com) overrides the default
+# production endpoint. listen.v2 uses environment.production for the /v2/listen ws.
+def _build_client():
+    base_url = os.environ.get("DEEPGRAM_BASE_URL")
+    if base_url:
+        https = base_url.replace("wss://", "https://").replace("ws://", "http://")
+        env = DeepgramClientEnvironment(
+            base=https, production=base_url, agent=base_url, agent_rest=https
+        )
+        print(f"Using custom Deepgram base URL: {base_url}")
+        return AsyncDeepgramClient(api_key=API_KEY, environment=env)
+    return AsyncDeepgramClient(api_key=API_KEY)
+
+
+deepgram = _build_client()
+
+
+def _safe_error_detail(e):
+    """Build a browser-safe (and log-safe) description of a Deepgram error.
+
+    NEVER surface str(e): a deepgram-sdk ApiError stringifies its request
+    headers, which include `Authorization: Token <api-key>`. Forwarding that
+    to the browser (or writing it to logs) leaks the API key, so we only ever
+    expose the exception's HTTP status or type name.
+    """
+    if isinstance(e, ApiError):
+        return f"Deepgram rejected the connection (HTTP {e.status_code})"
+    return f"Failed to connect to Deepgram ({type(e).__name__})"
 
 
 class FluxConsumer(AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.deepgram_ws = None
+        self.connection = None
+        self._connection_cm = None
         self.forward_task = None
-        self.stop_event = asyncio.Event()
 
     async def connect(self):
         """Accept WebSocket connection from client"""
@@ -51,7 +86,6 @@ class FluxConsumer(AsyncWebsocketConsumer):
         query_string = self.scope.get('query_string', b'').decode('utf-8')
         params = parse_qs(query_string)
 
-        model = DEFAULT_MODEL
         encoding = params.get('encoding', ['linear16'])[0]
         sample_rate = params.get('sample_rate', ['16000'])[0]
         eot_threshold = params.get('eot_threshold', [None])[0]
@@ -59,42 +93,37 @@ class FluxConsumer(AsyncWebsocketConsumer):
         eot_timeout_ms = params.get('eot_timeout_ms', [None])[0]
         keyterms = params.get('keyterm', [])
 
-        # Build Deepgram WebSocket URL with parameters
-        deepgram_params = {
-            'model': model,
-            'encoding': encoding,
-            'sample_rate': sample_rate,
+        connect_kwargs = {
+            "model": DEFAULT_MODEL,
+            "encoding": encoding,
+            "sample_rate": sample_rate,
         }
         if eot_threshold:
-            deepgram_params['eot_threshold'] = eot_threshold
+            connect_kwargs["eot_threshold"] = eot_threshold
         if eager_eot_threshold:
-            deepgram_params['eager_eot_threshold'] = eager_eot_threshold
+            connect_kwargs["eager_eot_threshold"] = eager_eot_threshold
         if eot_timeout_ms:
-            deepgram_params['eot_timeout_ms'] = eot_timeout_ms
+            connect_kwargs["eot_timeout_ms"] = eot_timeout_ms
+        if keyterms:
+            connect_kwargs["keyterm"] = keyterms
 
-        # Build URL with urlencode, then append multi-value keyterm params
-        deepgram_url = f"{DEEPGRAM_STT_URL}?{urlencode(deepgram_params)}"
-        for term in keyterms:
-            deepgram_url += f"&keyterm={term}"
-
-        print(f"Connecting to Deepgram Flux: model={model}, encoding={encoding}, sample_rate={sample_rate}")
+        print(f"Connecting to Deepgram Flux: model={DEFAULT_MODEL}, encoding={encoding}, sample_rate={sample_rate}")
 
         try:
-            # Connect to Deepgram
-            self.deepgram_ws = await websockets.connect(
-                deepgram_url,
-                additional_headers={"Authorization": f"Token {API_KEY}"}
-            )
+            # `connect()` is an async context manager; enter it manually so the
+            # connection lives across the consumer's connect/disconnect lifecycle.
+            self._connection_cm = deepgram.listen.v2.connect(**connect_kwargs)
+            self.connection = await self._connection_cm.__aenter__()
             print("Connected to Deepgram Flux API")
 
-            # Start forwarding task
             self.forward_task = asyncio.create_task(self.forward_from_deepgram())
 
         except Exception as e:
-            print(f"Error connecting to Deepgram: {e}")
+            detail = _safe_error_detail(e)
+            print(f"Error connecting to Deepgram: {detail}")
             await self.send(text_data=json.dumps({
                 "type": "Error",
-                "description": str(e),
+                "description": detail,
                 "code": "CONNECTION_FAILED"
             }))
             await self.close(code=3000)
@@ -102,7 +131,6 @@ class FluxConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         """Cleanup on disconnect"""
         print(f"Client disconnected: {close_code}")
-        self.stop_event.set()
 
         if self.forward_task:
             self.forward_task.cancel()
@@ -111,50 +139,65 @@ class FluxConsumer(AsyncWebsocketConsumer):
             except asyncio.CancelledError:
                 pass
 
-        if self.deepgram_ws:
+        if self._connection_cm:
             try:
-                await self.deepgram_ws.close()
+                await self._connection_cm.__aexit__(None, None, None)
             except Exception as e:
-                print(f"Error closing Deepgram connection: {e}")
+                print(f"Error closing Deepgram connection: {_safe_error_detail(e)}")
 
     async def receive(self, text_data=None, bytes_data=None):
-        """Forward messages from client to Deepgram"""
-        if not self.deepgram_ws:
+        """Forward audio (binary) and control messages (JSON) from client to Deepgram."""
+        if not self.connection:
             return
 
         try:
-            if text_data:
-                await self.deepgram_ws.send(text_data)
-            elif bytes_data:
-                await self.deepgram_ws.send(bytes_data)
+            if bytes_data:
+                await self.connection.send_media(bytes_data)
+            elif text_data:
+                try:
+                    data = json.loads(text_data)
+                except (ValueError, TypeError):
+                    print("Ignoring non-JSON message from client")
+                    return
+                if data.get("type") == "CloseStream":
+                    await self.connection.send_close_stream(ListenV2CloseStream(type="CloseStream"))
+                else:
+                    print(f"Ignoring unknown client message type: {data.get('type')}")
         except Exception as e:
-            print(f"Error forwarding to Deepgram: {e}")
+            print(f"Error forwarding to Deepgram: {_safe_error_detail(e)}")
             await self.close(code=3000)
 
     async def forward_from_deepgram(self):
-        """Forward messages from Deepgram to client"""
+        """Forward Deepgram messages to the browser: bytes as binary, models as JSON."""
         try:
-            async for message in self.deepgram_ws:
-                if self.stop_event.is_set():
-                    break
-
-                # Forward binary or text messages
-                if isinstance(message, bytes):
-                    await self.send(bytes_data=message)
+            async for message in self.connection:
+                if isinstance(message, (bytes, bytearray)):
+                    await self.send(bytes_data=bytes(message))
+                elif isinstance(message, dict):
+                    # listen.v2 (Flux) yields plain dicts (e.g. TurnInfo); forward as-is
+                    # so the transcript reaches the browser instead of {"type":"Unknown"}.
+                    await self.send(text_data=json.dumps(message))
+                elif hasattr(message, "model_dump_json"):
+                    await self.send(text_data=message.model_dump_json())
                 else:
-                    await self.send(text_data=message)
-
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"Deepgram connection closed: {e.code} {e.reason}")
+                    await self.send(text_data=json.dumps(
+                        {"type": getattr(message, "type", "Unknown")}
+                    ))
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"Error forwarding from Deepgram: {e}")
-            await self.send(text_data=json.dumps({
-                "type": "Error",
-                "description": str(e),
-                "code": "PROVIDER_ERROR"
-            }))
+            detail = _safe_error_detail(e)
+            print(f"Error forwarding from Deepgram: {detail}")
+            try:
+                await self.send(text_data=json.dumps({
+                    "type": "Error",
+                    "description": detail,
+                    "code": "PROVIDER_ERROR"
+                }))
+            except Exception:
+                pass
         finally:
-            if not self.stop_event.is_set():
+            try:
                 await self.close(code=1000)
+            except Exception:
+                pass
